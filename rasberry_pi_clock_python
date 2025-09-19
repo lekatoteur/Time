@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+Circular Time Keeping Device (Pure Python, Pygame) — 60fps
+
+- Fullscreen by default (use --windowed WIDTH HEIGHT to window it)
+- WCAG-like color palette for 12 hours (12 o'clock is index 0)
+- Concentric hour circles; current hour circle grows with minutes/seconds/ms
+- Current hour circle has a bright border halo
+- Auto-hide cursor after 3s idle; gentle screensaver reset every 30s
+
+Dependencies:
+    sudo apt-get update
+    sudo apt-get install -y python3-pip
+    pip3 install pygame
+
+Run:
+    python3 circular_clock.py               # fullscreen
+    python3 circular_clock.py --windowed 1080 1920
+"""
+
+import argparse
+import math
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+import pygame
+
+
+# 12-hour palette (12 at index 0), hex -> RGB
+HOUR_COLORS_HEX = [
+    "#FFFFFF",  # 12 - White
+    "#000080",  # 1 - Navy Blue
+    "#FFD700",  # 2 - Gold
+    "#4B0082",  # 3 - Indigo
+    "#FF6347",  # 4 - Tomato
+    "#2F4F4F",  # 5 - Dark Slate Gray
+    "#FFFF00",  # 6 - Yellow
+    "#8B0000",  # 7 - Dark Red
+    "#00CED1",  # 8 - Dark Turquoise
+    "#800080",  # 9 - Purple
+    "#FFA500",  # 10 - Orange
+    "#006400",  # 11 - Dark Green
+]
+
+
+def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+
+
+HOUR_COLORS = [hex_to_rgb(h) for h in HOUR_COLORS_HEX]
+
+
+def get_hour_index_12(now: datetime) -> int:
+    """Return palette index (0..11) where 0 represents hour 12."""
+    h = now.hour  # 0..23
+    hour12 = 12 if h == 0 or h == 12 else h % 12
+    return 0 if hour12 == 12 else hour12  # 12->0, otherwise 1..11
+
+
+def get_fractional_minutes(now: datetime) -> float:
+    """minutes + seconds/60 + milliseconds/60000 for smooth growth."""
+    return now.minute + now.second / 60.0 + now.microsecond / 60000000.0
+
+
+def prevent_screensaver():
+    """
+    Nudge the system so the screensaver doesn't kick in.
+    We try common tools; failures are silently ignored.
+    """
+    try:
+        # Works on many X11 setups
+        subprocess.run(["xdg-screensaver", "reset"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    try:
+        # Another X11 fallback
+        subprocess.run(["xset", "s", "reset"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def draw_circles(screen: pygame.Surface, w: int, h: int, font: pygame.font.Font | None = None):
+    """
+    Draw concentric hour circles centered on screen.
+    Past hours: full-size. Current hour: grows from 0 -> max over the hour.
+    Current hour gets a white-ish halo/border for emphasis.
+    """
+    now = datetime.now()
+    idx = get_hour_index_12(now)  # 0..11 (0=12)
+    frac_minutes = get_fractional_minutes(now)  # 0..60
+    # like 100vmin: use the smaller dimension; leave a margin
+    max_size = int(min(w, h) * 0.9)
+    center = (w // 2, h // 2)
+
+    # Clear background to black (page had black body)
+    screen.fill((0, 0, 0))
+
+    # Draw all past hours (<= current index - 1) as full-size discs
+    # z-order: earlier hours behind later ones
+    for i in range(0, idx):
+        color = HOUR_COLORS[i]
+        size = max_size  # full
+        radius = size // 2
+        pygame.draw.circle(screen, color, center, radius)
+
+    # Draw current hour circle with growth
+    color = HOUR_COLORS[idx]
+    growth_size = int((frac_minutes / 60.0) * (max_size - 0))  # 0 -> max_size
+    growth_size = max(0, min(growth_size, max_size))
+    radius = growth_size // 2
+    if radius > 0:
+        pygame.draw.circle(screen, color, center, radius)
+
+        # Halo/border for current hour (like .current-hour css)
+        # Draw a slightly larger ring with semi-opaque white
+        halo_thickness = max(2, int(max_size * 0.006))  # scale with screen
+        # Ensure halo renders even on tiny sizes
+        pygame.draw.circle(screen, (255, 255, 255), center, radius, width=halo_thickness)
+
+        # Soft glow: optional subtle outer ring
+        # (uncomment if you want a stronger glow)
+        # glow_radius = radius + halo_thickness * 2
+        # if glow_radius > radius:
+        #     pygame.draw.circle(screen, (200, 200, 200), center, glow_radius, width=1)
+
+    # Optional hour label in the center (kept minimal; comment out to remove)
+    if font:
+        hour12 = 12 if (idx == 0) else idx
+        label = f"{hour12:02d}"
+        text_surf = font.render(label, True, (255, 255, 255))
+        text_rect = text_surf.get_rect(center=center)
+        # Slight drop shadow for legibility
+        shadow = text_surf.copy()
+        shadow.fill((0, 0, 0))
+        shadow.set_alpha(120)
+        shadow_rect = shadow.get_rect(center=(center[0] + 2, center[1] + 2))
+        screen.blit(shadow, shadow_rect)
+        screen.blit(text_surf, text_rect)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Circular Time Keeping Device (Pure Python)")
+    parser.add_argument("--windowed", nargs=2, metavar=("WIDTH", "HEIGHT"), help="Run windowed (e.g., 1080 1920)")
+    parser.add_argument("--fps", type=int, default=60, help="Target FPS (default 60)")
+    parser.add_argument("--no-cursor-hide", action="store_true", help="Do not auto-hide cursor")
+    parser.add_argument("--no-keepawake", action="store_true", help="Disable periodic screensaver reset")
+    parser.add_argument("--no-label", action="store_true", help="Hide hour label in the center")
+    args = parser.parse_args()
+
+    pygame.init()
+    pygame.display.set_caption("Circular Time Keeping Device")
+
+    flags = 0
+    size = (0, 0)
+    if args.windowed:
+        w, h = int(args.windowed[0]), int(args.windowed[1])
+        size = (w, h)
+        screen = pygame.display.set_mode(size, flags)
+    else:
+        # Fullscreen; vsync if available
+        flags = pygame.FULLSCREEN
+        try:
+            screen = pygame.display.set_mode((0, 0), flags, vsync=1)
+        except TypeError:
+            # Older pygame: no vsync kwarg
+            screen = pygame.display.set_mode((0, 0), flags)
+    clock = pygame.time.Clock()
+
+    # Prepare font (optional center label)
+    font = None
+    if not args.no_label:
+        try:
+            font = pygame.font.SysFont("Courier New, Courier, monospace", max(24, int(min(screen.get_width(), screen.get_height()) * 0.025)))
+        except Exception:
+            font = pygame.font.Font(None, max(24, int(min(screen.get_width(), screen.get_height()) * 0.025)))
+
+    # Auto-hide cursor after inactivity
+    cursor_visible = True
+    last_mouse_move = time.time()
+    hide_delay = 3.0  # seconds
+
+    # Keep screen awake ping timer
+    last_keepawake = time.time()
+    keepawake_interval = 30.0  # seconds
+
+    running = True
+    while running:
+        now_ts = time.time()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN):
+                last_mouse_move = now_ts
+                if not cursor_visible:
+                    pygame.mouse.set_visible(True)
+                    cursor_visible = True
+            elif event.type == pygame.KEYDOWN:
+                # Escape to quit; F toggles fullscreen if desired
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+
+        # Hide cursor after inactivity
+        if not args.no_cursor_hide and cursor_visible and (now_ts - last_mouse_move) > hide_delay:
+            pygame.mouse.set_visible(False)
+            cursor_visible = False
+
+        # Keep the screen awake
+        if not args.no_keepawake and (now_ts - last_keepawake) > keepawake_interval:
+            prevent_screensaver()
+            last_keepawake = now_ts
+
+        # Draw frame
+        w, h = screen.get_width(), screen.get_height()
+        draw_circles(screen, w, h, font if not args.no_label else None)
+
+        pygame.display.flip()
+        clock.tick(args.fps)  # 60fps
+
+    pygame.quit()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+
+
+"""
+--- Optional: systemd autostart (recommended for Raspberry Pi OS with desktop) ---
+
+1) Save this file as /home/pi/circular_clock.py and make it executable:
+   chmod +x /home/pi/circular_clock.py
+
+2) Create a systemd user service:
+   mkdir -p ~/.config/systemd/user
+   nano ~/.config/systemd/user/circular-clock.service
+
+3) Paste:
+
+[Unit]
+Description=Circular Time Keeping Device
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/pi/circular_clock.py
+Restart=on-failure
+Environment=PYTHONUNBUFFERED=1
+# Uncomment to run windowed for debugging:
+# ExecStart=/usr/bin/python3 /home/pi/circular_clock.py --windowed 1080 1920
+
+[Install]
+WantedBy=default.target
+
+4) Enable & start:
+   systemctl --user daemon-reload
+   systemctl --user enable circular-clock.service
+   systemctl --user start circular-clock.service
+
+5) To stop:
+   systemctl --user stop circular-clock.service
+
+"""
